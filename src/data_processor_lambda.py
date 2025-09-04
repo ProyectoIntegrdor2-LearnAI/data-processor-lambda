@@ -598,7 +598,7 @@ class CourseDataProcessor:
             result = self.mongo_service.bulk_upsert(operations)
             
             self.metrics.processed_count += int(result["upserted"]) + int(result["modified"])
-            # CORREGIDO: Evitar duplicados negativos
+            # FIXED: Avoid negative duplicates
             dups = max(int(result["matched"]) - int(result["modified"]), 0)
             self.metrics.duplicates_count += int(dups)
             self.metrics.errors_count += int(result["errors"])
