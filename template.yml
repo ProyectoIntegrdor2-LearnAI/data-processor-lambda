@@ -1,0 +1,110 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: LearnIA Data Processor (S3 -> Lambda -> MongoDB + Bedrock embeddings) usando EventBridge
+
+Parameters:
+  Env:
+    Type: String
+    Default: dev
+  IngestBucketName:
+    Type: String
+    Default: learnia-tempscraping-data
+  AtlasUri:
+    Type: String
+  AwsRegion:
+    Type: String
+    Default: us-east-2
+  EmbeddingProvider:
+    Type: String
+    Default: bedrock
+  EmbeddingModel:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+  EmbeddingDim:
+    Type: Number
+    Default: 1024
+
+Globals:
+  Function:
+    Runtime: python3.12         # usa 3.12 (3.13 aún no es runtime de Lambda)
+    Timeout: 300
+    MemorySize: 1024
+    Architectures: [x86_64]
+    CodeUri: src/
+    Handler: data_processor_lambda.lambda_handler
+    Environment:
+      Variables:
+        ATLAS_URI: !Ref AtlasUri
+        DATABASE_NAME: learnia_db
+        COLLECTION_NAME: courses
+        AWS_REGION: !Ref AwsRegion
+        S3_BUCKET: !Ref IngestBucketName
+        EMBEDDING_PROVIDER: !Ref EmbeddingProvider
+        EMBEDDING_MODEL: !Ref EmbeddingModel
+        EMBEDDING_DIM: !Ref EmbeddingDim
+        ATLAS_SEARCH_INDEX: default
+        NUM_CANDIDATES_FACTOR: 30
+        SEMANTIC_DEDUP_ENABLED: true
+        SEMANTIC_DEDUP_MIN_DOCS: 200
+        SEMANTIC_DEDUP_THRESHOLD: 0.97
+        BATCH_SIZE: 50
+        DEDUP_KEY: url
+        MAX_RETRIES: 3
+    Policies:
+      - AWSLambdaBasicExecutionRole
+      - Statement:  # CloudWatch métricas custom
+          - Effect: Allow
+            Action: cloudwatch:PutMetricData
+            Resource: "*"
+      - Statement:  # Lectura del bucket
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:HeadObject
+            Resource: !Sub arn:aws:s3:::${IngestBucketName}/*
+      - Statement:  # Bedrock Titan embeddings
+          - Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
+
+Resources:
+  DataProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub learnia-data-processor-${Env}
+      Events:  # EventBridge escucha los eventos de S3 (sin tocar el bucket)
+        S3JsonCreated:
+          Type: EventBridgeRule
+          Properties:
+            Role: arn:aws:iam::974724840334:role/learnia-data-processor-role
+            Pattern:
+              source: [ "aws.s3" ]
+              detail-type: [ "Object Created" ]
+              detail:
+                bucket:
+                  name: [ !Ref IngestBucketName ]
+                object:
+                  key:
+                    - prefix: "ingest/"
+                    - suffix: ".json"
+        S3JsonlCreated:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [ "aws.s3" ]
+              detail-type: [ "Object Created" ]
+              detail:
+                bucket:
+                  name: [ !Ref IngestBucketName ]
+                object:
+                  key:
+                    - prefix: "ingest/"
+                    - suffix: ".jsonl"
+
+Outputs:
+  FunctionName:
+    Value: !Ref DataProcessorFunction
+  FunctionArn:
+    Value: !GetAtt DataProcessorFunction.Arn
