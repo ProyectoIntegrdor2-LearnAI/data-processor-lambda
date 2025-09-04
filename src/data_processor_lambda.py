@@ -4,15 +4,14 @@ import json
 import time
 import logging
 import hashlib
-from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass
+import re
+from typing import List, Dict, Any, Optional, Tuple, Union
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from functools import lru_cache
 import numpy as np
 import boto3
 from botocore.exceptions import ClientError
 from pymongo import MongoClient, UpdateOne, ASCENDING, errors as mongo_errors
-from pymongo.collection import Collection
 
 # =========================
 # Configuración y Constantes
@@ -40,16 +39,11 @@ class ProcessingConfig:
     semantic_dedup_min_docs: int = int(os.getenv("SEMANTIC_DEDUP_MIN_DOCS", "200"))
     
     # Embeddings Provider
-    embedding_provider: str = os.getenv("EMBEDDING_PROVIDER", "bedrock")  # ollama|bedrock|openai
-    embedding_model: str = os.getenv("EMBEDDING_MODEL", "amazon.titan-embed-text-v1")
-    embedding_dim: int = int(os.getenv("EMBEDDING_DIM", "1536"))
-    
-    # Ollama (solo para desarrollo local)
-    ollama_host: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-    ollama_model: str = os.getenv("OLLAMA_MODEL", "bge-m3")
+    embedding_provider: str = os.getenv("EMBEDDING_PROVIDER", "bedrock")
+    embedding_model: str = os.getenv("EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")
+    embedding_dim: int = int(os.getenv("EMBEDDING_DIM", "1024"))
 
     # AWS
-    aws_region: str = os.getenv("AWS_REGION", "us-east-2")
     s3_bucket: str = os.getenv("S3_BUCKET", "learnia-scraping-data")
     
     # Procesamiento
@@ -63,18 +57,14 @@ class ProcessingConfig:
     server_selection_timeout_ms: int = int(os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "10000"))
     
     # Categorización
-    categories_mapping: Dict[str, List[str]] = None
-    
-    def __post_init__(self):
-        if not self.categories_mapping:
-            self.categories_mapping = {
-                "programming": ["programming", "development", "coding", "software", "python", "javascript", "java", "react"],
-                "data_science": ["data", "analytics", "machine learning", "ai", "statistics", "data science", "sql"],
-                "design": ["design", "ui", "ux", "graphics", "visual", "photoshop", "figma"],
-                "business": ["business", "marketing", "entrepreneurship", "management", "leadership"],
-                "technology": ["technology", "cloud", "devops", "cybersecurity", "aws", "docker"],
-                "general": []
-            }
+    categories_mapping: Dict[str, List[str]] = field(default_factory=lambda: {
+        "programming": ["programming", "development", "coding", "software", "python", "javascript", "java", "react"],
+        "data_science": ["data", "analytics", "machine learning", "ai", "statistics", "data science", "sql"],
+        "design": ["design", "ui", "ux", "graphics", "visual", "photoshop", "figma"],
+        "business": ["business", "marketing", "entrepreneurship", "management", "leadership"],
+        "technology": ["technology", "cloud", "devops", "cybersecurity", "aws", "docker"],
+        "general": []
+    })
 
 class ProcessingMetrics:
     """Métricas de procesamiento para CloudWatch"""
@@ -130,7 +120,6 @@ def clean_text(text: str) -> str:
     if not text:
         return ""
     
-    import re
     text = re.sub(r'\s+', ' ', text)  # Múltiples espacios -> uno
     text = re.sub(r'[^\w\s\.\,\;\:\!\?\-]', ' ', text)  # Solo alfanuméricos y puntuación básica
     return text.strip()
@@ -245,17 +234,11 @@ class EmbeddingService:
         self.max_retries = config.max_retries
         self.cache = EmbeddingCache(max_size=int(os.getenv("EMBEDDING_CACHE_MAX", "5000")))
         
-        # Inicializar cliente según provider
-        if self.provider == "bedrock":
-            self.bedrock_client = boto3.client('bedrock-runtime', region_name=config.aws_region)
-        elif self.provider == "ollama":
-            import ollama
-            self.ollama_client = ollama.Client(host=config.ollama_host)
-        elif self.provider == "openai":
-            # Requiere: pip install openai
-            import openai
-            self.openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    
+        # Inicializar únicamente Bedrock
+        if self.provider != "bedrock":
+            logger.info(f"Embedding provider '{self.provider}' no soportado aquí; forzando 'bedrock'")
+            self.provider = "bedrock"
+        self.bedrock_client = boto3.client('bedrock-runtime')
     def _generate_bedrock_embedding(self, text: str) -> List[float]:
         """Genera embedding usando AWS Bedrock (CORREGIDO)"""
         try:
@@ -272,29 +255,6 @@ class EmbeddingService:
             logger.error(f"Error con Bedrock: {e}")
             raise
     
-    def _generate_ollama_embedding(self, text: str) -> List[float]:
-        """Genera embedding usando Ollama (desarrollo local)"""
-        try:
-            response = self.ollama_client.embeddings(
-                model=self.config.ollama_model, 
-                prompt=text
-            )
-            return response["embedding"]
-        except Exception as e:
-            logger.error(f"Error con Ollama: {e}")
-            raise
-    
-    def _generate_openai_embedding(self, text: str) -> List[float]:
-        """Genera embedding usando OpenAI"""
-        try:
-            response = self.openai_client.embeddings.create(
-                model=self.config.embedding_model,
-                input=text
-            )
-            return response.data[0].embedding
-        except Exception as e:
-            logger.error(f"Error con OpenAI: {e}")
-            raise
     
     def generate_embedding(self, text: str) -> Tuple[List[float], float]:
         """Genera embedding con cache FUNCIONAL y retry"""
@@ -310,14 +270,8 @@ class EmbeddingService:
             try:
                 t0 = time.perf_counter()
                 
-                if self.provider == "bedrock":
-                    embedding = self._generate_bedrock_embedding(text)
-                elif self.provider == "ollama":
-                    embedding = self._generate_ollama_embedding(text)
-                elif self.provider == "openai":
-                    embedding = self._generate_openai_embedding(text)
-                else:
-                    raise ValueError(f"Provider no soportado: {self.provider}")
+                # Solo Bedrock
+                embedding = self._generate_bedrock_embedding(text)
                 
                 embedding_time = (time.perf_counter() - t0) * 1000
                 
@@ -469,7 +423,7 @@ class MongoService:
             
         return False
     
-    def bulk_upsert(self, operations: List[UpdateOne]) -> Dict[str, int]:
+    def bulk_upsert(self, operations: List[UpdateOne]) -> Dict[str, Union[int, float]]:
         """Ejecuta operaciones bulk con manejo de errores"""
         if not operations:
             return {"upserted": 0, "modified": 0, "matched": 0, "errors": 0}
@@ -643,11 +597,11 @@ class CourseDataProcessor:
         if operations:
             result = self.mongo_service.bulk_upsert(operations)
             
-            self.metrics.processed_count += result["upserted"] + result["modified"]
+            self.metrics.processed_count += int(result["upserted"]) + int(result["modified"])
             # CORREGIDO: Evitar duplicados negativos
-            dups = max(result["matched"] - result["modified"], 0)
-            self.metrics.duplicates_count += dups
-            self.metrics.errors_count += result["errors"]
+            dups = max(int(result["matched"]) - int(result["modified"]), 0)
+            self.metrics.duplicates_count += int(dups)
+            self.metrics.errors_count += int(result["errors"])
             self.metrics.add_bulk_time(result.get("bulk_time_ms", 0))
             
             logger.info(json.dumps({
@@ -754,13 +708,13 @@ class CourseDataProcessor:
         
         return True
     
-    def _update_metrics_from_result(self, result: Dict[str, int], operations_count: int):
+    def _update_metrics_from_result(self, result: Dict[str, Union[int, float]], operations_count: int):
         """Actualiza métricas desde resultado de bulk operation - CORREGIDO"""
-        self.metrics.processed_count += result["upserted"] + result["modified"]
+        self.metrics.processed_count += int(result["upserted"]) + int(result["modified"])
         # CORREGIDO: Evitar duplicados negativos
-        dups = max(result["matched"] - result["modified"], 0)
-        self.metrics.duplicates_count += dups
-        self.metrics.errors_count += result["errors"]
+        dups = max(int(result["matched"]) - int(result["modified"]), 0)
+        self.metrics.duplicates_count += int(dups)
+        self.metrics.errors_count += int(result["errors"])
         self.metrics.add_bulk_time(result.get("bulk_time_ms", 0))
     
     def get_processing_summary(self) -> Dict[str, Any]:
@@ -770,6 +724,38 @@ class CourseDataProcessor:
 # =========================
 # Lambda Handler Principal
 # =========================
+
+def _process_one_s3_object(processor, s3_service, bucket, key, processed_files):
+    logger.info(json.dumps({"processing_started": True, "s3_bucket": bucket, "s3_key": key}))
+    file_size = s3_service.get_file_size(key, bucket=bucket)
+    if file_size > 200 * 1024 * 1024:  # 200MB
+        logger.error(f"Archivo demasiado grande para Lambda: {file_size / 1024 / 1024:.1f}MB")
+        return
+    local_file = f"/tmp/{os.path.basename(key)}"
+    if not s3_service.download_file(key, local_file, bucket=bucket):
+        logger.error(f"No se pudo descargar archivo: {key}")
+        return
+    try:
+        success = False
+        if key.endswith(('.jsonl', '.ndjson')):
+            logger.info("Procesando como archivo JSONL")
+            success = processor.process_file_jsonl(local_file)
+        else:
+            logger.info("Procesando como archivo JSON")
+            success = processor.process_file_json(local_file)
+        if success:
+            processed_files.append(key)
+            logger.info(json.dumps({
+                "file_processed_successfully": True,
+                "s3_key": key,
+                "file_size_mb": file_size / 1024 / 1024
+            }))
+        else:
+            logger.error(f"Error procesando archivo: {key}")
+    finally:
+        if os.path.exists(local_file):
+            os.remove(local_file)
+            logger.debug(f"Archivo temporal removido: {local_file}")
 
 def lambda_handler(event, context):
     """Handler principal para AWS Lambda"""
@@ -782,56 +768,21 @@ def lambda_handler(event, context):
     processed_files = []
     
     try:
-        # Procesar eventos S3
+        # Procesar eventos S3 (Notification) o EventBridge (Object Created)
         if 'Records' in event:
+            # S3 Notification shape
             for record in event['Records']:
                 if record.get('eventSource') == 'aws:s3':
                     bucket = record['s3']['bucket']['name']
                     key = record['s3']['object']['key']
-                    
-                    logger.info(json.dumps({
-                        "processing_started": True,
-                        "s3_bucket": bucket,
-                        "s3_key": key
-                    }))
-                    
-                    # Verificar tamaño del archivo - CORREGIDO: usar bucket del evento
-                    file_size = s3_service.get_file_size(key, bucket=bucket)
-                    if file_size > 200 * 1024 * 1024:  # 200MB
-                        logger.error(f"Archivo demasiado grande para Lambda: {file_size / 1024 / 1024:.1f}MB")
-                        continue
-                    
-                    # Descargar archivo desde S3 - CORREGIDO: usar bucket del evento
-                    local_file = f"/tmp/{os.path.basename(key)}"
-                    if not s3_service.download_file(key, local_file, bucket=bucket):
-                        logger.error(f"No se pudo descargar archivo: {key}")
-                        continue
-                    
-                    try:
-                        # Determinar tipo de archivo y procesar
-                        success = False
-                        if key.endswith('.jsonl') or key.endswith('.ndjson'):
-                            logger.info("Procesando como archivo JSONL")
-                            success = processor.process_file_jsonl(local_file)
-                        else:
-                            logger.info("Procesando como archivo JSON")
-                            success = processor.process_file_json(local_file)
-                        
-                        if success:
-                            processed_files.append(key)
-                            logger.info(json.dumps({
-                                "file_processed_successfully": True,
-                                "s3_key": key,
-                                "file_size_mb": file_size / 1024 / 1024
-                            }))
-                        else:
-                            logger.error(f"Error procesando archivo: {key}")
-                    
-                    finally:
-                        # Limpiar archivo temporal
-                        if os.path.exists(local_file):
-                            os.remove(local_file)
-                            logger.debug(f"Archivo temporal removido: {local_file}")
+                    _process_one_s3_object(processor, s3_service, bucket, key, processed_files)
+        elif 'detail' in event and 'bucket' in event['detail'] and 'object' in event['detail']:
+            # EventBridge shape
+            bucket = event['detail']['bucket']['name']
+            key = event['detail']['object']['key']
+            _process_one_s3_object(processor, s3_service, bucket, key, processed_files)
+        else:
+            logger.warning(f"Evento no reconocido: {json.dumps(event)}")
         
         # Obtener métricas finales
         summary = processor.get_processing_summary()
@@ -849,7 +800,7 @@ def lambda_handler(event, context):
         
         # Enviar métricas custom a CloudWatch
         try:
-            cloudwatch = boto3.client('cloudwatch', region_name=config.aws_region)
+            cloudwatch = boto3.client('cloudwatch')
             
             metrics_to_send = [
                 ('ProcessedDocuments', summary['processed_documents'], 'Count'),
@@ -908,134 +859,3 @@ def lambda_handler(event, context):
                 'processed_files': processed_files
             })
         }
-
-# =========================
-# Función principal (testing local)
-# =========================
-
-def main():
-    """Función principal para ejecución local y testing"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Data Processor para LearnIA')
-    parser.add_argument('--file', required=True, help='Archivo JSON/JSONL a procesar')
-    parser.add_argument('--format', choices=['json', 'jsonl'], 
-                       help='Formato del archivo (auto-detecta por extensión)')
-    parser.add_argument('--batch-size', type=int, default=50, help='Tamaño de lote')
-    parser.add_argument('--provider', choices=['ollama', 'bedrock', 'openai'], 
-                       default='ollama', help='Provider de embeddings')
-    parser.add_argument('--semantic-dedup', action='store_true', 
-                       help='Activar deduplicación semántica')
-    
-    args = parser.parse_args()
-    
-    # Configurar variables de entorno para testing local
-    os.environ.setdefault("BATCH_SIZE", str(args.batch_size))
-    os.environ.setdefault("EMBEDDING_PROVIDER", args.provider)
-    
-    if args.semantic_dedup:
-        os.environ.setdefault("SEMANTIC_DEDUP_THRESHOLD", "0.95")
-    else:
-        os.environ.setdefault("SEMANTIC_DEDUP_THRESHOLD", "1.0")  # Desactivar
-    
-    # Validar configuración
-    config = ProcessingConfig()
-    
-    if not config.atlas_uri:
-        print("❌ Error: Variable de entorno ATLAS_URI requerida")
-        return 1
-    
-    if config.embedding_provider == 'bedrock' and not os.getenv('AWS_ACCESS_KEY_ID'):
-        print("❌ Error: Credenciales AWS requeridas para Bedrock")
-        return 1
-    
-    if config.embedding_provider == 'openai' and not os.getenv('OPENAI_API_KEY'):
-        print("❌ Error: OPENAI_API_KEY requerida para OpenAI")
-        return 1
-    
-    # Obtener servicios
-    try:
-        _, embedding_service, mongo_service, s3_service = get_services()
-    except Exception as e:
-        print(f"❌ Error inicializando servicios: {e}")
-        return 1
-    
-    # Crear procesador
-    processor = CourseDataProcessor(config, embedding_service, mongo_service, s3_service)
-    
-    try:
-        print(f"🚀 Iniciando procesamiento de: {args.file}")
-        print(f"📊 Configuración:")
-        print(f"   - Provider: {config.embedding_provider}")
-        print(f"   - Modelo: {config.embedding_model}")
-        print(f"   - Batch size: {config.batch_size}")
-        print(f"   - Deduplicación semántica: {'✅' if config.semantic_dedup_enabled else '❌'}")
-        print(f"   - Índice Atlas: {config.atlas_search_index}")
-        print(f"   - Umbral semántico: {config.semantic_dedup_threshold}")
-        
-        # Determinar formato y procesar
-        success = False
-        file_format = args.format
-        
-        if not file_format:
-            if args.file.endswith(('.jsonl', '.ndjson')):
-                file_format = 'jsonl'
-            else:
-                file_format = 'json'
-        
-        print(f"   - Formato detectado: {file_format.upper()}")
-        print()
-        
-        if file_format == 'jsonl':
-            success = processor.process_file_jsonl(args.file)
-        else:
-            success = processor.process_file_json(args.file)
-        
-        # Mostrar resumen
-        summary = processor.get_processing_summary()
-        cache_stats = embedding_service.get_cache_stats()
-        
-        print("\n" + "="*50)
-        print("📈 RESUMEN DEL PROCESAMIENTO")
-        print("="*50)
-        
-        for key, value in summary.items():
-            if isinstance(value, float):
-                print(f"{key:.<30} {value:.2f}")
-            else:
-                print(f"{key:.<30} {value}")
-        
-        print("\n" + "="*50)
-        print("🗄️  ESTADÍSTICAS DE CACHE")
-        print("="*50)
-        
-        for key, value in cache_stats.items():
-            if isinstance(value, float):
-                print(f"{key:.<30} {value:.2f}")
-            else:
-                print(f"{key:.<30} {value}")
-        
-        print("="*50)
-        
-        if success:
-            print("✅ Procesamiento completado exitosamente")
-            return 0
-        else:
-            print("❌ Procesamiento completado con errores")
-            return 1
-            
-    except KeyboardInterrupt:
-        print("\n⚠️ Procesamiento interrumpido por usuario")
-        return 1
-    except Exception as e:
-        print(f"\n❌ Error durante procesamiento: {e}")
-        return 1
-    finally:
-        try:
-            mongo_service.close()
-            print("🔌 Conexión a MongoDB cerrada")
-        except:
-            pass
-
-if __name__ == "__main__":
-    exit(main())

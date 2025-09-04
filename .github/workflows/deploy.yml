@@ -1,0 +1,54 @@
+name: Deploy SAM (dev)
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: sam-deploy-dev
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::974724840334:role/github-oidc-sam-deployer
+          aws-region: us-east-2
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install SAM CLI
+        uses: aws-actions/setup-sam@v2
+
+      - name: Validate template
+        run: sam validate --lint
+
+      - name: Build
+        run: sam build --use-container
+
+      - name: Deploy
+        env:
+          ATLAS_URI_DEV: ${{ secrets.ATLAS_URI_DEV }}
+        run: |
+          sam deploy \
+            --no-fail-on-empty-changeset \
+            --stack-name learnia-data-processor-dev \
+            --region us-east-2 \
+            --s3-bucket learnia-sam-artifacts-us-east-2 \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides \
+              Env=dev \
+              IngestBucketName=learnia-tempscraping-data \
+              AtlasUri="$ATLAS_URI_DEV"
