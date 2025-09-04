@@ -711,7 +711,7 @@ class CourseDataProcessor:
     def _update_metrics_from_result(self, result: Dict[str, Union[int, float]], operations_count: int):
         """Actualiza métricas desde resultado de bulk operation - CORREGIDO"""
         self.metrics.processed_count += int(result["upserted"]) + int(result["modified"])
-        # CORREGIDO: Evitar duplicados negativos
+        # FIXED: Avoid negative duplicates
         dups = max(int(result["matched"]) - int(result["modified"]), 0)
         self.metrics.duplicates_count += int(dups)
         self.metrics.errors_count += int(result["errors"])
