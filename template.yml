@@ -50,25 +50,6 @@ Globals:
         DEDUP_KEY: url
         MAX_RETRIES: 3
 
-    Policies:
-      - AWSLambdaBasicExecutionRole
-      - Statement:  # CloudWatch métricas custom
-          - Effect: Allow
-            Action: cloudwatch:PutMetricData
-            Resource: "*"
-      - Statement:  # Lectura del bucket
-          - Effect: Allow
-            Action:
-              - s3:GetObject
-              - s3:HeadObject
-            Resource: !Sub arn:aws:s3:::${IngestBucketName}/*
-      - Statement:  # Bedrock Titan embeddings
-          - Effect: Allow
-            Action:
-              - bedrock:InvokeModel
-              - bedrock:InvokeModelWithResponseStream
-            Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
-
 Resources:
   DataProcessorFunction:
     Type: AWS::Serverless::Function
