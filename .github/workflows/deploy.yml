@@ -32,17 +32,24 @@ jobs:
       - name: Install SAM CLI
         uses: aws-actions/setup-sam@v2
 
+      - name: Show template
+        run: |
+          ls -la
+          echo "----- template.yml head -----"
+          sed -n '1,200p' template.yml
+
       - name: Validate template
-        run: sam validate --lint
+        run: sam validate --lint -t template.yml
 
       - name: Build
-        run: sam build --use-container
+        run: sam build -t template.yml --use-container
 
       - name: Deploy
         env:
           ATLAS_URI_DEV: ${{ secrets.ATLAS_URI_DEV }}
         run: |
           sam deploy \
+            --template-file .aws-sam/build/template.yaml \
             --no-fail-on-empty-changeset \
             --stack-name learnia-data-processor-dev \
             --region us-east-2 \
