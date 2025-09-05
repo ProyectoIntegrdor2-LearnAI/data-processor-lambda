@@ -26,7 +26,7 @@ Parameters:
 
 Globals:
   Function:
-    Runtime: python3.12         # usa 3.12 (3.13 aún no es runtime de Lambda)
+    Runtime: python3.12
     Timeout: 300
     MemorySize: 1024
     Architectures: [x86_64]
@@ -37,7 +37,6 @@ Globals:
         ATLAS_URI: !Ref AtlasUri
         DATABASE_NAME: learnia_db
         COLLECTION_NAME: courses
-        AWS_REGION: !Ref AwsRegion
         S3_BUCKET: !Ref IngestBucketName
         EMBEDDING_PROVIDER: !Ref EmbeddingProvider
         EMBEDDING_MODEL: !Ref EmbeddingModel
@@ -50,6 +49,7 @@ Globals:
         BATCH_SIZE: 50
         DEDUP_KEY: url
         MAX_RETRIES: 3
+
     Policies:
       - AWSLambdaBasicExecutionRole
       - Statement:  # CloudWatch métricas custom
@@ -68,33 +68,6 @@ Globals:
               - bedrock:InvokeModel
               - bedrock:InvokeModelWithResponseStream
             Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
-
-Globals:
-  Function:
-    Runtime: python3.12
-    Timeout: 300
-    MemorySize: 1024
-    Architectures: [x86_64]
-    CodeUri: src/
-    Handler: data_processor_lambda.lambda_handler
-    Environment:
-      Variables:
-        ATLAS_URI: !Ref AtlasUri
-        DATABASE_NAME: learnia_db
-        COLLECTION_NAME: courses
-        # ❌ NO definas AWS_REGION aquí, es reservada
-        S3_BUCKET: !Ref IngestBucketName
-        EMBEDDING_PROVIDER: !Ref EmbeddingProvider
-        EMBEDDING_MODEL: !Ref EmbeddingModel
-        EMBEDDING_DIM: !Ref EmbeddingDim
-        ATLAS_SEARCH_INDEX: default
-        NUM_CANDIDATES_FACTOR: 30
-        SEMANTIC_DEDUP_ENABLED: true
-        SEMANTIC_DEDUP_MIN_DOCS: 200
-        SEMANTIC_DEDUP_THRESHOLD: 0.97
-        BATCH_SIZE: 50
-        DEDUP_KEY: url
-        MAX_RETRIES: 3
 
 Resources:
   DataProcessorFunction:
