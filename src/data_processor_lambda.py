@@ -124,9 +124,21 @@ def clean_text(text: str) -> str:
     text = re.sub(r'[^\w\s\.\,\;\:\!\?\-]', ' ', text)  # Solo alfanuméricos y puntuación básica
     return text.strip()
 
-def generate_content_hash(title: str, description: str) -> str:
-    """Genera hash único basado en contenido para deduplicación"""
-    content = f"{title.lower().strip()}|{description.lower().strip()}"
+def generate_content_hash(title: str, description: str, platform: str = "", instructor: str = "") -> str:
+    """
+    Genera hash único basado en contenido para deduplicación robusta.
+    Incluye título, descripción, plataforma e instructor para mejor precisión.
+    """
+    # Normalizar texto: lowercase, sin espacios extras
+    title_norm = ' '.join(title.lower().strip().split())
+    desc_norm = ' '.join(description.lower().strip().split())
+    platform_norm = ' '.join(platform.lower().strip().split())
+    instructor_norm = ' '.join(instructor.lower().strip().split())
+    
+    # Combinar campos relevantes para hash único
+    content = f"{title_norm}|{desc_norm}|{platform_norm}|{instructor_norm}"
+    
+    # SHA256 truncado a 16 caracteres (suficiente para millones de cursos)
     return hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]
 
 def to_float(x, default=0.0):
@@ -532,23 +544,34 @@ class CourseDataProcessor:
                 logger.info(f"Curso duplicado semánticamente omitido: {title}")
                 return None
             
-            # Enriquecer datos con categorización automática
+            # Extraer campos con fallback español->inglés
+            platform = doc.get("platform", doc.get("plataforma", "unknown"))
+            instructor = doc.get("instructor", doc.get("profesor", doc.get("author", "")))
+            
+            # Enriquecer datos con categorización automática - SOLO CAMPOS EN INGLÉS
             processed_doc = {
+                # Campos principales
                 "title": title,
                 "description": description,
                 "url": doc.get("url", doc.get("enlace", "")),
-                "platform": doc.get("platform", doc.get("plataforma", "unknown")),
-                "instructor": doc.get("instructor", doc.get("author", "")),
-                "rating": to_float(doc.get("calificacion", doc.get("rating", 0))),
-                "duration": doc.get("duracion", doc.get("duration", "")),
-                "price": to_float(doc.get("precio", doc.get("price", 0))),
-                "students_count": to_int(doc.get("estudiantes", doc.get("students", 0))),
-                "language": doc.get("idioma", doc.get("language", "es")),
+                "platform": platform,
+                "instructor": instructor,
                 
-                # Campos enriquecidos
+                # Métricas
+                "rating": to_float(doc.get("rating", doc.get("calificacion", 0))),
+                "duration": doc.get("duration", doc.get("duracion", "")),
+                "price": to_float(doc.get("price", doc.get("precio", 0))),
+                "students_count": to_int(doc.get("students_count", doc.get("estudiantes", doc.get("students", 0)))),
+                
+                # Metadatos
+                "language": doc.get("language", doc.get("idioma", "es")),
                 "category": categorize_course(title, description, self.config),
                 "level": extract_course_level(description),
-                "content_hash": generate_content_hash(title, description),
+                
+                # Hash mejorado (incluye platform e instructor)
+                "content_hash": generate_content_hash(title, description, platform, instructor),
+                
+                # Embedding
                 "embedding": embedding,
                 
                 # Metadatos de procesamiento
@@ -556,13 +579,8 @@ class CourseDataProcessor:
                 "embedding_model": self.config.embedding_model,
                 "embedding_provider": self.config.embedding_provider,
                 "embedding_dim": len(embedding),
-                "processing_version": "2.1"
+                "processing_version": "2.2"  # Incrementado por cambio de estructura
             }
-            
-            # Preservar campos adicionales del documento original
-            for key, value in doc.items():
-                if key not in processed_doc and not key.startswith('_'):
-                    processed_doc[key] = value
                     
             return processed_doc
             
