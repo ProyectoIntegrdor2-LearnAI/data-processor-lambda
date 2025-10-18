@@ -27,7 +27,7 @@ Parameters:
 Globals:
   Function:
     Runtime: python3.12
-    Timeout: 300
+    Timeout: 900  # 15 minutos (máximo permitido)
     MemorySize: 1024
     Architectures: [x86_64]
     CodeUri: src/
@@ -48,13 +48,15 @@ Globals:
         SEMANTIC_DEDUP_THRESHOLD: 0.97
         BATCH_SIZE: 50
         DEDUP_KEY: url
-        MAX_RETRIES: 3
+        MAX_RETRIES: 5  # Aumentado de 3 a 5 para mejor resiliencia
+        BEDROCK_RATE_LIMIT_DELAY: "0.15"  # 150ms entre llamadas a Bedrock
 
 Resources:
   DataProcessorFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub learnia-data-processor-${Env}
+      ReservedConcurrentExecutions: 1  # Procesar 1 archivo a la vez (evita throttling)
       # ✅ Aquí van las políticas
       Policies:
         - AWSLambdaBasicExecutionRole

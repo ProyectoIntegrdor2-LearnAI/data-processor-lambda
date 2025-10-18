@@ -246,13 +246,25 @@ class EmbeddingService:
         self.max_retries = config.max_retries
         self.cache = EmbeddingCache(max_size=int(os.getenv("EMBEDDING_CACHE_MAX", "5000")))
         
+        # Rate limiting configuration (NUEVO)
+        self.rate_limit_delay = float(os.getenv("BEDROCK_RATE_LIMIT_DELAY", "0.1"))  # 100ms entre llamadas
+        self.last_call_time = 0.0
+        
         # Inicializar únicamente Bedrock
         if self.provider != "bedrock":
             logger.info(f"Embedding provider '{self.provider}' no soportado aquí; forzando 'bedrock'")
             self.provider = "bedrock"
         self.bedrock_client = boto3.client('bedrock-runtime')
     def _generate_bedrock_embedding(self, text: str) -> List[float]:
-        """Genera embedding usando AWS Bedrock (CORREGIDO)"""
+        """Genera embedding usando AWS Bedrock con rate limiting (CORREGIDO)"""
+        # Rate limiting: asegurar delay mínimo entre llamadas
+        current_time = time.perf_counter()
+        time_since_last_call = current_time - self.last_call_time
+        
+        if time_since_last_call < self.rate_limit_delay:
+            sleep_time = self.rate_limit_delay - time_since_last_call
+            time.sleep(sleep_time)
+        
         try:
             response = self.bedrock_client.invoke_model(
                 modelId=self.config.embedding_model,
@@ -262,14 +274,16 @@ class EmbeddingService:
             )
             
             result = json.loads(response['body'].read())
+            self.last_call_time = time.perf_counter()
             return result['embedding']
         except Exception as e:
             logger.error(f"Error con Bedrock: {e}")
+            self.last_call_time = time.perf_counter()
             raise
     
     
     def generate_embedding(self, text: str) -> Tuple[List[float], float]:
-        """Genera embedding con cache FUNCIONAL y retry"""
+        """Genera embedding con cache FUNCIONAL y retry con exponential backoff mejorado"""
         key = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
         
         # Verificar cache LRU REAL
@@ -277,12 +291,12 @@ class EmbeddingService:
         if cached is not None:
             return cached, 0.0
         
-        # Generar embedding con retry
+        # Generar embedding con retry y exponential backoff mejorado
         for attempt in range(self.max_retries):
             try:
                 t0 = time.perf_counter()
                 
-                # Solo Bedrock
+                # Solo Bedrock (con rate limiting interno)
                 embedding = self._generate_bedrock_embedding(text)
                 
                 embedding_time = (time.perf_counter() - t0) * 1000
@@ -297,6 +311,21 @@ class EmbeddingService:
                 
                 return embedding, embedding_time
                 
+            except ClientError as e:
+                error_code = e.response.get('Error', {}).get('Code', '')
+                
+                # Manejo específico de throttling
+                if error_code == 'ThrottlingException':
+                    # Backoff más agresivo para throttling
+                    backoff_time = min(2 ** (attempt + 2), 60)  # Máximo 60 segundos
+                    logger.warning(f"ThrottlingException (intento {attempt + 1}/{self.max_retries}): esperando {backoff_time}s")
+                    time.sleep(backoff_time)
+                else:
+                    logger.warning(f"Error generando embedding (intento {attempt + 1}): {e}")
+                    if attempt == self.max_retries - 1:
+                        raise
+                    time.sleep(2 ** attempt)
+                    
             except Exception as e:
                 logger.warning(f"Error generando embedding (intento {attempt + 1}): {e}")
                 if attempt == self.max_retries - 1:
@@ -708,21 +737,45 @@ class CourseDataProcessor:
             return False
     
     def _process_data_array(self, data: List[Dict[str, Any]]) -> bool:
-        """Procesa array de datos en lotes"""
+        """Procesa array de datos en lotes con logs de progreso detallados"""
         if not isinstance(data, list):
             logger.error("Los datos deben ser un array de documentos")
             return False
         
-        logger.info(f"Iniciando procesamiento de {len(data)} documentos")
+        total_docs = len(data)
+        logger.info(f"Iniciando procesamiento de {total_docs} documentos en lotes de {self.config.batch_size}")
+        
+        batch_start_time = time.perf_counter()
         
         # Procesar en lotes
-        for i in range(0, len(data), self.config.batch_size):
+        for i in range(0, total_docs, self.config.batch_size):
+            batch_num = (i // self.config.batch_size) + 1
+            total_batches = (total_docs + self.config.batch_size - 1) // self.config.batch_size
+            
             batch = data[i:i + self.config.batch_size]
             self.process_batch(batch)
             
-            # Log de progreso
-            progress = min(i + self.config.batch_size, len(data))
-            logger.info(f"Progreso: {progress}/{len(data)} documentos")
+            # Calcular estadísticas de progreso
+            progress = min(i + self.config.batch_size, total_docs)
+            progress_pct = (progress / total_docs) * 100
+            elapsed_time = time.perf_counter() - batch_start_time
+            docs_per_sec = progress / elapsed_time if elapsed_time > 0 else 0
+            remaining_docs = total_docs - progress
+            estimated_remaining_time = remaining_docs / docs_per_sec if docs_per_sec > 0 else 0
+            
+            # Log de progreso detallado
+            logger.info(json.dumps({
+                "progress": f"{progress}/{total_docs}",
+                "progress_percent": round(progress_pct, 1),
+                "batch": f"{batch_num}/{total_batches}",
+                "docs_per_second": round(docs_per_sec, 2),
+                "elapsed_seconds": round(elapsed_time, 1),
+                "estimated_remaining_seconds": round(estimated_remaining_time, 1),
+                "processed": self.metrics.processed_count,
+                "duplicates": self.metrics.duplicates_count,
+                "semantic_duplicates": self.metrics.semantic_duplicates,
+                "errors": self.metrics.errors_count
+            }))
         
         return True
     
