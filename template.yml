@@ -92,21 +92,7 @@ Resources:
                   name: [ !Ref IngestBucketName ]
                 object:
                   key:
-                    - prefix: "ingest/"
-                      suffix: ".json"
-        S3JsonlCreated:
-          Type: EventBridgeRule
-          Properties:
-            Pattern:
-              source: [ "aws.s3" ]
-              detail-type: [ "Object Created" ]
-              detail:
-                bucket:
-                  name: [ !Ref IngestBucketName ]
-                object:
-                  key:
-                    - prefix: "ingest/"
-                      suffix: ".jsonl"
+                    - suffix: ".json"
 
 Outputs:
   FunctionName:
