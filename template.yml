@@ -56,7 +56,10 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub learnia-data-processor-${Env}
-      ReservedConcurrentExecutions: 1  # Procesar 1 archivo a la vez (evita throttling)
+      # NOTA: ReservedConcurrentExecutions comentado temporalmente por permisos IAM
+      # Configurar manualmente después del despliegue con:
+      # aws lambda put-function-concurrency --function-name learnia-data-processor-dev --reserved-concurrent-executions 1
+      # ReservedConcurrentExecutions: 1
       # ✅ Aquí van las políticas
       Policies:
         - AWSLambdaBasicExecutionRole
