@@ -93,7 +93,7 @@ Resources:
                 object:
                   key:
                     - prefix: "ingest/"
-                    - suffix: ".json"
+                      suffix: ".json"
         S3JsonlCreated:
           Type: EventBridgeRule
           Properties:
@@ -106,7 +106,7 @@ Resources:
                 object:
                   key:
                     - prefix: "ingest/"
-                    - suffix: ".jsonl"
+                      suffix: ".jsonl"
 
 Outputs:
   FunctionName:
