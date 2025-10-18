@@ -49,7 +49,8 @@ Globals:
         BATCH_SIZE: 50
         DEDUP_KEY: url
         MAX_RETRIES: 5  # Aumentado de 3 a 5 para mejor resiliencia
-        BEDROCK_RATE_LIMIT_DELAY: "0.15"  # 150ms entre llamadas a Bedrock
+        BEDROCK_RATE_LIMIT_DELAY: "0.5"  # 500ms entre llamadas a Bedrock para evitar throttling
+        EMBEDDING_CACHE_MAX: "10000"  # Cache más grande para reducir llamadas a Bedrock
 
 Resources:
   DataProcessorFunction:

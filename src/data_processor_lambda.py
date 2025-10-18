@@ -246,8 +246,8 @@ class EmbeddingService:
         self.max_retries = config.max_retries
         self.cache = EmbeddingCache(max_size=int(os.getenv("EMBEDDING_CACHE_MAX", "5000")))
         
-        # Rate limiting configuration (NUEVO)
-        self.rate_limit_delay = float(os.getenv("BEDROCK_RATE_LIMIT_DELAY", "0.1"))  # 100ms entre llamadas
+        # Rate limiting configuration - AUMENTADO para evitar throttling
+        self.rate_limit_delay = float(os.getenv("BEDROCK_RATE_LIMIT_DELAY", "0.5"))  # 500ms entre llamadas (antes 100ms)
         self.last_call_time = 0.0
         
         # Inicializar únicamente Bedrock
@@ -316,10 +316,14 @@ class EmbeddingService:
                 
                 # Manejo específico de throttling
                 if error_code == 'ThrottlingException':
-                    # Backoff más agresivo para throttling
-                    backoff_time = min(2 ** (attempt + 2), 60)  # Máximo 60 segundos
-                    logger.warning(f"ThrottlingException (intento {attempt + 1}/{self.max_retries}): esperando {backoff_time}s")
-                    time.sleep(backoff_time)
+                    # Backoff más agresivo para throttling: 8s, 16s, 32s, 60s, 60s
+                    backoff_time = min(2 ** (attempt + 3), 60)  # Máximo 60 segundos
+                    if attempt < self.max_retries - 1:
+                        logger.warning(f"ThrottlingException (intento {attempt + 1}/{self.max_retries}): esperando {backoff_time}s")
+                        time.sleep(backoff_time)
+                    else:
+                        logger.error(f"ThrottlingException agotó todos los reintentos ({self.max_retries})")
+                        raise
                 else:
                     logger.warning(f"Error generando embedding (intento {attempt + 1}): {e}")
                     if attempt == self.max_retries - 1:
@@ -550,7 +554,7 @@ class CourseDataProcessor:
         self.metrics = ProcessingMetrics()
         
     def process_document(self, doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Procesa un documento individual con limpieza y enriquecimiento"""
+        """Procesa un documento individual con limpieza y enriquecimiento - CON MANEJO DE ERRORES MEJORADO"""
         try:
             # Extraer y limpiar datos básicos
             title = clean_text(doc.get("titulo", doc.get("title", "")))
@@ -563,9 +567,15 @@ class CourseDataProcessor:
             # Construir texto para embedding
             embedding_text = f"Título del curso: {title}. Descripción: {description}"
             
-            # Generar embedding
-            embedding, embed_time = self.embedding_service.generate_embedding(embedding_text)
-            self.metrics.add_embedding_time(embed_time)
+            # Generar embedding CON REINTENTOS
+            try:
+                embedding, embed_time = self.embedding_service.generate_embedding(embedding_text)
+                self.metrics.add_embedding_time(embed_time)
+            except Exception as embed_error:
+                # Si falla el embedding después de todos los reintentos, registrar y continuar
+                logger.error(f"Error crítico generando embedding para '{title[:50]}...': {embed_error}")
+                self.metrics.errors_count += 1
+                return None  # Saltar este documento pero continuar con el siguiente
             
             # Verificar duplicado semántico
             if self.mongo_service.is_semantic_duplicate(embedding):
@@ -608,7 +618,7 @@ class CourseDataProcessor:
                 "embedding_model": self.config.embedding_model,
                 "embedding_provider": self.config.embedding_provider,
                 "embedding_dim": len(embedding),
-                "processing_version": "2.2"  # Incrementado por cambio de estructura
+                "processing_version": "2.3"  # Incrementado por mejor manejo de errores
             }
                     
             return processed_doc
