@@ -47,9 +47,10 @@ Globals:
         SEMANTIC_DEDUP_MIN_DOCS: 200
         SEMANTIC_DEDUP_THRESHOLD: 0.97
         BATCH_SIZE: 50
+        MAX_DOCS_PER_INVOCATION: 100  # Máximo de documentos por invocación Lambda
         DEDUP_KEY: url
         MAX_RETRIES: 5  # Aumentado de 3 a 5 para mejor resiliencia
-        BEDROCK_RATE_LIMIT_DELAY: "0.5"  # 500ms entre llamadas a Bedrock para evitar throttling
+        BEDROCK_RATE_LIMIT_DELAY: "1.2"  # 1.2s entre llamadas a Bedrock (500 docs en ~10 min)
         EMBEDDING_CACHE_MAX: "10000"  # Cache más grande para reducir llamadas a Bedrock
 
 Resources:
@@ -80,6 +81,10 @@ Resources:
                 - bedrock:InvokeModel
                 - bedrock:InvokeModelWithResponseStream
               Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:learnia-data-processor-${Env}
       Events:
         S3JsonCreated:
           Type: EventBridgeRule

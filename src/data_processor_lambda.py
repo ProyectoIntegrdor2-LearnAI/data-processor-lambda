@@ -48,6 +48,7 @@ class ProcessingConfig:
     
     # Procesamiento
     batch_size: int = int(os.getenv("BATCH_SIZE", "50"))
+    max_docs_per_invocation: int = int(os.getenv("MAX_DOCS_PER_INVOCATION", "100"))  # Máximo de documentos por invocación Lambda
     dedup_key: str = os.getenv("DEDUP_KEY", "url")
     max_retries: int = int(os.getenv("MAX_RETRIES", "3"))
     semantic_dedup_threshold: float = float(os.getenv("SEMANTIC_DEDUP_THRESHOLD", "0.97"))
@@ -618,7 +619,7 @@ class CourseDataProcessor:
                 "embedding_model": self.config.embedding_model,
                 "embedding_provider": self.config.embedding_provider,
                 "embedding_dim": len(embedding),
-                "processing_version": "2.3"  # Incrementado por mejor manejo de errores
+                "processing_version": "2.4"  # Incrementado: procesamiento por lotes con auto-invocación
             }
                     
             return processed_doc
@@ -674,8 +675,13 @@ class CourseDataProcessor:
         
         return False
     
-    def process_file_json(self, file_path: str) -> bool:
-        """Procesa archivo JSON completo"""
+    def process_file_json(self, file_path: str, start_index: int = 0) -> Tuple[bool, int, int]:
+        """
+        Procesa archivo JSON con paginación
+        
+        Returns:
+            Tuple[bool, int, int]: (success, last_processed_index, total_docs)
+        """
         try:
             file_size = os.path.getsize(file_path)
             if file_size > 100 * 1024 * 1024:  # 100MB
@@ -684,11 +690,18 @@ class CourseDataProcessor:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
-            return self._process_data_array(data)
+            if not isinstance(data, list):
+                logger.error("El archivo JSON debe contener un array de documentos")
+                return False, 0, 0
+            
+            total_docs = len(data)
+            success, last_index = self._process_data_array(data, start_index)
+            
+            return success, last_index, total_docs
             
         except Exception as e:
             logger.error(f"Error procesando archivo JSON {file_path}: {e}")
-            return False
+            return False, 0, 0
     
     def process_file_jsonl(self, file_path: str) -> bool:
         """Procesa archivo JSONL línea por línea (recomendado para archivos grandes)"""
@@ -746,36 +759,46 @@ class CourseDataProcessor:
             logger.error(f"Error procesando archivo JSONL {file_path}: {e}")
             return False
     
-    def _process_data_array(self, data: List[Dict[str, Any]]) -> bool:
-        """Procesa array de datos en lotes con logs de progreso detallados"""
+    def _process_data_array(self, data: List[Dict[str, Any]], start_index: int = 0) -> Tuple[bool, int]:
+        """
+        Procesa array de datos en lotes con logs de progreso detallados
+        
+        Returns:
+            Tuple[bool, int]: (success, last_processed_index)
+        """
         if not isinstance(data, list):
             logger.error("Los datos deben ser un array de documentos")
-            return False
+            return False, 0
         
         total_docs = len(data)
-        logger.info(f"Iniciando procesamiento de {total_docs} documentos en lotes de {self.config.batch_size}")
+        max_docs = self.config.max_docs_per_invocation
+        end_index = min(start_index + max_docs, total_docs)
+        
+        logger.info(f"Procesando documentos {start_index} a {end_index} de {total_docs} totales")
         
         batch_start_time = time.perf_counter()
         
-        # Procesar en lotes
-        for i in range(0, total_docs, self.config.batch_size):
-            batch_num = (i // self.config.batch_size) + 1
-            total_batches = (total_docs + self.config.batch_size - 1) // self.config.batch_size
+        # Procesar en lotes desde start_index hasta end_index
+        for i in range(start_index, end_index, self.config.batch_size):
+            batch_num = ((i - start_index) // self.config.batch_size) + 1
+            total_batches = ((end_index - start_index) + self.config.batch_size - 1) // self.config.batch_size
             
             batch = data[i:i + self.config.batch_size]
             self.process_batch(batch)
             
             # Calcular estadísticas de progreso
-            progress = min(i + self.config.batch_size, total_docs)
-            progress_pct = (progress / total_docs) * 100
+            progress = min(i + self.config.batch_size, end_index) - start_index
+            docs_in_range = end_index - start_index
+            progress_pct = (progress / docs_in_range) * 100
             elapsed_time = time.perf_counter() - batch_start_time
             docs_per_sec = progress / elapsed_time if elapsed_time > 0 else 0
-            remaining_docs = total_docs - progress
+            remaining_docs = end_index - (i + self.config.batch_size)
             estimated_remaining_time = remaining_docs / docs_per_sec if docs_per_sec > 0 else 0
             
             # Log de progreso detallado
             logger.info(json.dumps({
-                "progress": f"{progress}/{total_docs}",
+                "progress": f"{i + self.config.batch_size - start_index}/{docs_in_range}",
+                "overall_progress": f"{i + self.config.batch_size}/{total_docs}",
                 "progress_percent": round(progress_pct, 1),
                 "batch": f"{batch_num}/{total_batches}",
                 "docs_per_second": round(docs_per_sec, 2),
@@ -787,7 +810,7 @@ class CourseDataProcessor:
                 "errors": self.metrics.errors_count
             }))
         
-        return True
+        return True, end_index
     
     def _update_metrics_from_result(self, result: Dict[str, Union[int, float]], operations_count: int):
         """Actualiza métricas desde resultado de bulk operation - CORREGIDO"""
@@ -806,40 +829,65 @@ class CourseDataProcessor:
 # Lambda Handler Principal
 # =========================
 
-def _process_one_s3_object(processor, s3_service, bucket, key, processed_files):
-    logger.info(json.dumps({"processing_started": True, "s3_bucket": bucket, "s3_key": key}))
+def _process_one_s3_object(processor, s3_service, bucket, key, processed_files, start_index=0):
+    """
+    Procesa un objeto de S3
+    
+    Returns:
+        Dict con información de continuación si es necesario
+    """
+    logger.info(json.dumps({"processing_started": True, "s3_bucket": bucket, "s3_key": key, "start_index": start_index}))
     file_size = s3_service.get_file_size(key, bucket=bucket)
     if file_size > 200 * 1024 * 1024:  # 200MB
         logger.error(f"Archivo demasiado grande para Lambda: {file_size / 1024 / 1024:.1f}MB")
-        return
+        return None
     local_file = f"/tmp/{os.path.basename(key)}"
     if not s3_service.download_file(key, local_file, bucket=bucket):
         logger.error(f"No se pudo descargar archivo: {key}")
-        return
+        return None
     try:
         success = False
+        last_index = 0
+        total_docs = 0
+        
         if key.endswith(('.jsonl', '.ndjson')):
             logger.info("Procesando como archivo JSONL")
             success = processor.process_file_jsonl(local_file)
+            # JSONL se procesa completo en una sola invocación
+            return None
         else:
-            logger.info("Procesando como archivo JSON")
-            success = processor.process_file_json(local_file)
+            logger.info(f"Procesando como archivo JSON desde índice {start_index}")
+            success, last_index, total_docs = processor.process_file_json(local_file, start_index)
+        
         if success:
             processed_files.append(key)
             logger.info(json.dumps({
                 "file_processed_successfully": True,
                 "s3_key": key,
-                "file_size_mb": file_size / 1024 / 1024
+                "file_size_mb": file_size / 1024 / 1024,
+                "processed_range": f"{start_index}-{last_index}/{total_docs}"
             }))
+            
+            # Verificar si quedan documentos por procesar
+            if last_index < total_docs:
+                logger.info(f"Quedan {total_docs - last_index} documentos por procesar")
+                return {
+                    "bucket": bucket,
+                    "key": key,
+                    "start_index": last_index,
+                    "total_docs": total_docs
+                }
         else:
             logger.error(f"Error procesando archivo: {key}")
+        
+        return None
     finally:
         if os.path.exists(local_file):
             os.remove(local_file)
             logger.debug(f"Archivo temporal removido: {local_file}")
 
 def lambda_handler(event, context):
-    """Handler principal para AWS Lambda"""
+    """Handler principal para AWS Lambda con soporte para procesamiento por lotes"""
     # Obtener servicios singleton
     config, embedding_service, mongo_service, s3_service = get_services()
     
@@ -847,23 +895,59 @@ def lambda_handler(event, context):
     processor = CourseDataProcessor(config, embedding_service, mongo_service, s3_service)
     
     processed_files = []
+    continuation_event = None
     
     try:
+        # Detectar si es una continuación (invocación recursiva)
+        is_continuation = event.get('continuation', False)
+        start_index = event.get('start_index', 0)
+        
+        if is_continuation:
+            # Procesar continuación
+            bucket = event['bucket']
+            key = event['key']
+            logger.info(f"Continuando procesamiento de {key} desde índice {start_index}")
+            continuation_event = _process_one_s3_object(processor, s3_service, bucket, key, processed_files, start_index)
+        
         # Procesar eventos S3 (Notification) o EventBridge (Object Created)
-        if 'Records' in event:
+        elif 'Records' in event:
             # S3 Notification shape
             for record in event['Records']:
                 if record.get('eventSource') == 'aws:s3':
                     bucket = record['s3']['bucket']['name']
                     key = record['s3']['object']['key']
-                    _process_one_s3_object(processor, s3_service, bucket, key, processed_files)
+                    continuation_event = _process_one_s3_object(processor, s3_service, bucket, key, processed_files)
         elif 'detail' in event and 'bucket' in event['detail'] and 'object' in event['detail']:
             # EventBridge shape
             bucket = event['detail']['bucket']['name']
             key = event['detail']['object']['key']
-            _process_one_s3_object(processor, s3_service, bucket, key, processed_files)
+            continuation_event = _process_one_s3_object(processor, s3_service, bucket, key, processed_files)
         else:
             logger.warning(f"Evento no reconocido: {json.dumps(event)}")
+        
+        # Si hay documentos restantes, invocar Lambda asíncronamente para continuar
+        if continuation_event:
+            lambda_client = boto3.client('lambda')
+            function_name = context.function_name
+            
+            continuation_payload = {
+                'continuation': True,
+                'bucket': continuation_event['bucket'],
+                'key': continuation_event['key'],
+                'start_index': continuation_event['start_index']
+            }
+            
+            logger.info(json.dumps({
+                "invoking_continuation": True,
+                "start_index": continuation_event['start_index'],
+                "remaining_docs": continuation_event['total_docs'] - continuation_event['start_index']
+            }))
+            
+            lambda_client.invoke(
+                FunctionName=function_name,
+                InvocationType='Event',  # Asíncrono
+                Payload=json.dumps(continuation_payload)
+            )
         
         # Obtener métricas finales
         summary = processor.get_processing_summary()
@@ -876,7 +960,8 @@ def lambda_handler(event, context):
             "lambda_execution_completed": True,
             "processed_files": processed_files,
             "metrics": summary,
-            "cache_stats": cache_stats
+            "cache_stats": cache_stats,
+            "has_continuation": continuation_event is not None
         }))
         
         # Enviar métricas custom a CloudWatch
@@ -922,7 +1007,8 @@ def lambda_handler(event, context):
                 'message': 'Processing completed successfully',
                 'processed_files': processed_files,
                 'metrics': summary,
-                'cache_stats': cache_stats
+                'cache_stats': cache_stats,
+                'has_continuation': continuation_event is not None
             })
         }
         
